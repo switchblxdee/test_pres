@@ -5,10 +5,9 @@
 пользователя (без приветствий, окружения, благодарностей). Текст цитаты собирается из
 наших же предложений — дословно, галлюцинации исключены by design.
 
-Цепочка (LCEL):
-    prompt | llm.with_structured_output(Selection)        # function calling
-      .with_fallbacks([prompt | llm | text -> Selection])  # ответ текстом / с <think>
-      .with_retry(...)
+Цепочки (LCEL): prompt | llm.with_structured_output(Selection) и prompt | llm | text -> Selection.
+Вызовы идут через RateGate (ratelimit.py): ограничение параллельности, общая пауза на 429,
+повторы 5xx; если модель не умеет function calling — со второй темы сразу текстовая цепочка.
 При полном отказе LLM — эвристика: лучший фрагмент по оценке «проблемности» предложений.
 """
 from __future__ import annotations
@@ -29,6 +28,7 @@ from pydantic import BaseModel, Field
 
 from .config import Config, LLMConfig, QuoteConfig
 from .data import Topic, norm
+from .ratelimit import FatalLLMError, RateGate, is_rate_limit, is_transient
 from .sentences import SPLITTER_VERSION, Quote, best_quote, quote_from_ids, split_sentences
 
 log = logging.getLogger(__name__)
@@ -206,24 +206,17 @@ def parse_selection(raw: str) -> Selection:
     raise ValueError(f"Не удалось разобрать ответ модели: {(raw or '')[:200]!r}")
 
 
-def _require(res: Selection | None) -> Selection:
-    # with_structured_output возвращает None, если модель ответила текстом без tool call —
-    # превращаем это в исключение, чтобы сработал with_fallbacks на текстовый парсер
-    if res is None or not res.quotes:
-        raise ValueError("пустой structured-ответ")
-    return res
-
-
-def build_extractor(llm: BaseChatModel, retries: int, structured: bool = True) -> Runnable:
+def build_chains(llm: BaseChatModel, structured: bool = True) -> tuple[Runnable | None, Runnable]:
+    """(structured-цепочка или None, текстовая цепочка). Ретраев и фолбэков внутри нет —
+    ими управляет QuoteSelector через RateGate, чтобы 429 не размножались."""
     text_chain = PROMPT | llm | StrOutputParser() | RunnableLambda(parse_selection)
-    chain: Runnable = text_chain
+    structured_chain = None
     if structured:
         try:
-            chain = (PROMPT | llm.with_structured_output(Selection) | RunnableLambda(_require)
-                     ).with_fallbacks([text_chain])
+            structured_chain = PROMPT | llm.with_structured_output(Selection)
         except NotImplementedError:  # модель без tool calling
-            chain = text_chain
-    return chain.with_retry(stop_after_attempt=max(1, retries), wait_exponential_jitter=True)
+            structured_chain = None
+    return structured_chain, text_chain
 
 
 def normalize_selection(sel: Selection, shown: list[list[str]]) -> list[list]:
@@ -261,10 +254,12 @@ class QuoteCache:
             self.data[key] = value
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1), encoding="utf-8")
-        tmp.replace(self.path)
+        with self._lock:
+            payload = json.dumps(self.data, ensure_ascii=False, indent=1)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(f".{threading.get_ident()}.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self.path)
 
 
 # ----------------------------------------------------------------------------- селектор (одна тема)
@@ -276,8 +271,11 @@ class QuoteSelector:
     def __init__(self, cfg: Config, llm: BaseChatModel | None = None):
         self.cfg = cfg
         self.llm = llm if llm is not None else make_chat_model(cfg.llm)
-        self.extractor = (build_extractor(self.llm, cfg.llm.retries, cfg.llm.structured_output)
-                          if self.llm is not None else None)
+        self.structured_chain, self.text_chain = (build_chains(self.llm, cfg.llm.structured_output)
+                                                  if self.llm is not None else (None, None))
+        self.gate = RateGate(cfg.llm.max_workers, cfg.llm.requests_per_minute)
+        self._tools_ok: bool | None = None   # поддерживает ли модель function calling (узнаём по ходу)
+        self._disabled: str | None = None    # фатальная ошибка (401/403/…) — LLM больше не зовём
         self.cache = QuoteCache(Path(cfg.llm.cache_dir) / "quotes.json")
         self.llm_calls = 0      # темы, ушедшие в LLM (без кэша)
         self.llm_failures = 0   # из них откатились на эвристику
@@ -323,12 +321,40 @@ class QuoteSelector:
             h.update(b"\x00")
         return h.hexdigest()
 
+    def _call(self, chain: Runnable, inputs: dict):
+        return self.gate.call(lambda: chain.invoke(inputs),
+                              rate_limit_retries=self.cfg.llm.rate_limit_retries, retries=self.cfg.llm.retries)
+
+    def _ask(self, inputs: dict) -> Selection:
+        """Один запрос на тему в нормальном режиме. Structured пробуем, пока модель
+        не показала, что function calling не поддерживает; дальше — сразу текст."""
+        if self.structured_chain is not None and self._tools_ok is not False:
+            try:
+                res = self._call(self.structured_chain, inputs)
+                if isinstance(res, Selection) and res.quotes:
+                    self._tools_ok = True
+                    return res
+            except FatalLLMError:
+                raise
+            except Exception as e:
+                if is_rate_limit(e) or is_transient(e):
+                    raise
+                # не HTTP-ошибка — модель ответила не вызовом функции
+            if self._tools_ok is None:
+                self._tools_ok = False
+                log.info("Модель не вернула вызов функции — дальше текстовый JSON, один запрос на тему")
+        return self._call(self.text_chain, inputs)
+
     def _extract(self, topic: Topic, shown: list[list[str]]) -> tuple[list[list], bool]:
         """(выбор LLM, надёжный ли результат). Сбой LLM не кэшируется."""
         with self._stats_lock:
             self.llm_calls += 1
+        if self._disabled:
+            with self._stats_lock:
+                self.llm_failures += 1
+            return [], False
         try:
-            sel: Selection = self.extractor.invoke({
+            sel = self._ask({
                 "product": topic.product, "topic": topic.title, "messages": self._format(shown),
                 "n_quotes": self.n_quotes, "max_chars": self.budget,
             })
@@ -336,10 +362,20 @@ class QuoteSelector:
             if picks:
                 return picks, True
             raise ValueError("в ответе нет ни одного существующего сообщения")
-        except Exception as e:  # сеть, 429, 5xx, мусор в ответе — после всех ретраев
+        except FatalLLMError as e:
             with self._stats_lock:
                 self.llm_failures += 1
-            log.warning("LLM не ответил для темы «%s» (%s) — беру эвристику", topic.title, e)
+                first = self._disabled is None
+                self._disabled = str(e)
+            if first:
+                log.error("LLM недоступна, повторять бессмысленно (%s). Остальные темы — эвристикой. "
+                          "Проверь сертификаты, base_url и имя модели.", e)
+            return [], False
+        except Exception as e:  # 429/5xx после всех повторов, мусор в ответе
+            with self._stats_lock:
+                self.llm_failures += 1
+            log.warning("LLM не ответил для темы «%s» (%s: %s) — беру эвристику",
+                        topic.title[:60], type(e).__name__, str(e)[:200])
             return [], False
 
     def select(self, topic: Topic) -> list[Quote]:
@@ -349,7 +385,7 @@ class QuoteSelector:
             return []
         shown = self._shown(cands)
         picks: list[list] = []
-        if self.extractor is not None and (len(cands) > 1 or len(shown[0]) > 1):
+        if self.text_chain is not None and (len(cands) > 1 or len(shown[0]) > 1):
             key = self._key(topic, cands)
             cached = self.cache.get(key)
             valid = isinstance(cached, list) and all(
@@ -361,6 +397,7 @@ class QuoteSelector:
                 picks, ok = self._extract(topic, shown)
                 if ok:
                     self.cache.put(key, picks)
+                    self.cache.save()  # сразу на диск: оборвётся прогон — готовые темы не пойдут в LLM снова
 
         quotes: list[Quote] = []
         used: set[int] = set()

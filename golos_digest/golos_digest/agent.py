@@ -170,7 +170,7 @@ class DigestAgent:
         if output_pptx.suffix.lower() != ".pptx":
             output_pptx = output_pptx.with_suffix(".pptx")
         log.info("Вход: %s", input_xlsx)
-        calls0, fails0 = self.selector.llm_calls, self.selector.llm_failures
+        calls0, fails0, n429_0 = self.selector.llm_calls, self.selector.llm_failures, self.selector.gate.n_429
         t0 = time.perf_counter()
 
         stop = threading.Event()
@@ -180,8 +180,10 @@ class DigestAgent:
                 with self._progress_lock:
                     done, total = self._done, self._total
                 if total and done < total:
-                    log.info("…жду ответы модели: готово %d/%d тем, прошло %.0f мин",
-                             done, total, (time.perf_counter() - t0) / 60)
+                    pause = self.selector.gate.paused_for
+                    log.info("…жду ответы модели: готово %d/%d тем, прошло %.0f мин%s",
+                             done, total, (time.perf_counter() - t0) / 60,
+                             f", пауза из-за лимита ещё {pause:.0f} с" if pause else "")
 
         hb = threading.Thread(target=heartbeat, daemon=True)
         hb.start()
@@ -199,6 +201,9 @@ class DigestAgent:
             seconds=time.perf_counter() - t0,
         )
         log.info("Готово: %s", result)
+        if (n429 := self.selector.gate.n_429 - n429_0):
+            log.info("Сервер %d раз ответил 429 — запросы переждали лимит. Если это постоянно, "
+                     "уменьши llm.max_workers или задай llm.requests_per_minute.", n429)
         if result.llm_failures:
             log.warning("У %d тем LLM не ответил — цитаты выбраны эвристикой (в кэш не записаны, "
                         "следующий запуск попробует снова)", result.llm_failures)

@@ -65,8 +65,10 @@ class LLMConfig:
     # Ранжировать через function calling. Если модель/контур не поддерживает функции —
     # false: сразу текстовый JSON, без лишнего запроса на каждую тему.
     structured_output: bool = True
-    retries: int = 3
-    max_workers: int = 8
+    retries: int = 3                 # повторы на 5xx/таймауты (429 сюда не входит)
+    max_workers: int = 2             # одновременных запросов к модели (при 429 снижается сам)
+    requests_per_minute: float = 0   # жёсткий потолок частоты; 0 — без ограничения
+    rate_limit_retries: int = 8      # сколько раз ждать и повторять после 429 на одну тему
     max_candidates: int = 40             # сколько сообщений по теме максимум уходит в промпт
     candidate_max_chars: int = 900       # обрезка длинных сообщений внутри промпта
     cache_dir: str = ".cache"

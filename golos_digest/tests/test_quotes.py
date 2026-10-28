@@ -99,7 +99,7 @@ def test_heuristic_skips_environment_and_greeting(cfg):
 @pytest.mark.parametrize("mode,calls,cached", [
     ("tool", 1, True),     # structured output
     ("text", 2, True),     # structured вернул None -> текстовый фолбэк (с <think>)
-    ("fail", 2, False),    # ретраи -> эвристика, сбой не кэшируется
+    ("fail", 1, False),    # сетевая ошибка: без лишнего текстового запроса -> эвристика, не кэшируется
 ])
 def test_selector_modes(cfg, mode, calls, cached):
     cfg.llm.backend, cfg.llm.retries = "gigachat", 1
