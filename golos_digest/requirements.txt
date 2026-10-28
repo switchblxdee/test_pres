@@ -1,0 +1,11 @@
+python-pptx>=1.0
+pandas>=2.0
+openpyxl>=3.1
+Pillow>=10.0
+PyYAML>=6.0
+lxml>=4.9
+pydantic>=2.0
+langchain-core>=0.3
+langgraph>=0.2
+langchain-gigachat>=0.3
+# langchain-openai>=0.2   # только для llm.backend: openai

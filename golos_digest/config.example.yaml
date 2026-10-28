@@ -1,0 +1,39 @@
+# Все поля необязательны — указывай только то, что меняешь.
+
+# template_path: template/template.pptx
+author: Голос IT                # автор в свойствах файла
+hide_zero_topics: true          # темы с 0 сигналов на текущей неделе не выводятся
+filter_markup_by_period: true   # цитаты только из сообщений внутри «Периода»
+
+# Иконка в карточке статуса, если в своде нет колонки «Иконка статуса».
+# pain = логотип («В списке болей»), analysis = лупа («На анализе»). Первое совпадение побеждает.
+status_icon_rules:
+  - ['кандидат\s+в\s+бол|на\s+анализе', analysis]
+  - ['в\s+списк\w*\s+бол', pain]
+resumed_status_regex: 'возобнов'
+
+llm:
+  backend: gigachat             # gigachat | openai | heuristic (без LLM, для отладки)
+  model: GigaChat-2-Max
+  credentials_env: GIGACHAT_CREDENTIALS   # имя переменной окружения с ключом авторизации
+  scope: GIGACHAT_API_CORP
+  # base_url: https://gigachat.devices.sberbank.ru/api/v1   # свой контур, если нужен
+  verify_ssl_certs: false
+  # ca_bundle_file: /path/to/russian_trusted_root_ca.cer
+  temperature: 0.05
+  max_workers: 8                # параллельные запросы по темам
+  max_candidates: 40            # сообщений на тему в промпте (после эвристического префильтра)
+  candidate_max_chars: 900
+  cache_dir: .cache             # повторный прогон на тех же данных не ходит в LLM
+
+quotes:
+  max_quotes: 1                 # 2 — добавлять вторую цитату, если влезает в max_quote_lines
+  max_quote_lines: 5
+  ideal_min_chars: 60
+  ideal_max_chars: 420
+  min_chars: 20
+
+fonts:
+  # Положи сюда SBSansDisplay-Regular/SemiBold/Light (.ttf/.otf) — переносы станут точными.
+  # fonts_dir: fonts/
+  width_safety: 1.04
