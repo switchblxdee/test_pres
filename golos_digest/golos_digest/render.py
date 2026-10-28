@@ -17,6 +17,7 @@ from pptx import Presentation
 from .config import Config
 from .data import Digest, Topic
 from .measure import EMU_PER_INCH, Measurer
+from .sentences import Quote, shorten_sentence
 from .ooxml import (
     SlideBuilder, clone, ensure_text_color, find_by_id, get_box, harden_nowrap, recolor, run_styles, set_body_attr, set_box,
     set_fill, set_line, set_text, write_paragraphs,
@@ -169,25 +170,50 @@ class Layouter:
                 hi = mid - 1
         return cand(lo)
 
-    @staticmethod
-    def _quote_body(q: str) -> str:
-        q = q.strip()
-        return q[1:-1] if q.startswith("«") and q.endswith("»") else q
-
     def _quote_lines(self, q: str) -> int:
         return self.m.n_lines(q, QUOTE_FONT, QUOTE_PT, TITLE_W)
 
-    def _fit_quotes(self, ranked: list[str], max_lines: int) -> tuple[list[str], int]:
-        if not ranked or max_lines <= 0:
+    def _fit_quote(self, q: Quote, max_lines: int, topic: str) -> str | None:
+        """Цитата в max_lines строк без обрыва посреди фразы:
+        1) убираем менее важные предложения с краёв (самое важное остаётся всегда);
+        2) если и одно предложение не влезает — берём его лучший фрагмент по запятым/союзам с «…»;
+        3) только если резать не по чему — обрезка по словам (крайний случай)."""
+        if max_lines <= 0:
+            return None
+        q = q.without_noise()
+        while self._quote_lines(q.text) > max_lines and (smaller := q.drop_edge()) is not None:
+            q = smaller
+        if self._quote_lines(q.text) <= max_lines:
+            return q.text
+        sentence = q.sentences[0]
+        lo, hi = 20, len(sentence)  # максимальный бюджет символов, при котором фрагмент влезает
+        best = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            frag = shorten_sentence(sentence, topic, mid)
+            if frag != sentence and self._quote_lines(f"«{frag}»") <= max_lines:
+                best, lo = frag, mid + 1
+            else:
+                hi = mid - 1
+        if best:
+            return f"«{best}»"
+        return self._clip(q.body, QUOTE_FONT, QUOTE_PT, TITLE_W, max_lines, "«", "»")
+
+    def _fit_quotes(self, ranked: list, max_lines: int, topic: str = "") -> tuple[list[str], int]:
+        quotes = [q if isinstance(q, Quote) else Quote.from_text(str(q).strip().strip("«»"), topic) for q in ranked]
+        if not quotes or max_lines <= 0:
             return [], 0
-        first = self._clip(self._quote_body(ranked[0]), QUOTE_FONT, QUOTE_PT, TITLE_W, max_lines, "«", "»")
+        first = self._fit_quote(quotes[0], max_lines, topic)
+        if first is None:
+            return [], 0
         out, used = [first], self._quote_lines(first)
-        for extra in ranked[1:self.cfg.quotes.max_quotes]:
-            q = f"«{self._quote_body(extra)}»"
-            n = self._quote_lines(q)
-            if used + n <= max_lines:
-                out.append(q)
-                used += n
+        for extra in quotes[1:self.cfg.quotes.max_quotes]:
+            left = max_lines - used
+            text = self._fit_quote(extra, left, topic) if left >= 2 else None
+            # вторая цитата — только целиком по предложениям, без обрезки по словам
+            if text and not text.endswith("…»") and self._quote_lines(text) <= left:
+                out.append(text)
+                used += self._quote_lines(text)
         gaps = (len(out) - 1) * QUOTE_PARA_GAP_PT * 12700
         return out, used * QUOTE_LH + gaps
 
@@ -202,7 +228,7 @@ class Layouter:
         return _RowBase(title, title_h, status, status_h)
 
     def _row(self, idx: int, t: Topic, base: _RowBase, max_lines: int) -> RowPlan:
-        quotes, quote_h = self._fit_quotes(t.quotes, max_lines)
+        quotes, quote_h = self._fit_quotes(t.quotes, max_lines, t.title)
         text_h = base.title_h + (TITLE_GAP + quote_h if quotes else 0)
         box_h = max(STATUS_MIN_H, text_h, base.status_h)
         return RowPlan(idx, t, 0, base.title, base.title_h, quotes, quote_h, base.status, box_h)

@@ -154,3 +154,25 @@ def test_kpi_labels_fit_wide_fallback_fonts(make_xlsx, cfg, tmp_path):
                 assert lx + lw <= cx + cw
                 return
     pytest.fail("подпись KPI не найдена")
+
+
+def test_quote_trimmed_by_whole_sentences_on_slide(cfg):
+    """Длинная цитата в тесный лимит строк: остаются целые предложения вокруг главного, без «…»."""
+    from golos_digest.data import Topic
+    from golos_digest.sentences import Quote
+    sents = ["У меня Windows 10 и VS Code 1.85, работаю через VDI.",
+             "При подключении MCP confluence-delta после пары запросов получаю ошибку 401.",
+             "Токен при этом валидный, перевыпуск помогает на час.",
+             "Из-за этого приходится вручную перевыпускать токен по несколько раз за день.",
+             "Спасибо!"]
+    q = Quote(sents, [-1.5, 6.0, 1.2, 2.5, -3.0])
+    t = Topic("P", "Ошибка 401 MCP", 5, 4, -1, "", None, False, False, quotes=[q])
+    lay = Layouter(cfg, Measurer(cfg.fonts))
+    for lines in (5, 3, 2, 1):
+        text = lay._fit_quotes(t.quotes, lines, t.title)[0][0]
+        body = text.strip("«»")
+        assert "…" not in body, (lines, text)
+        assert "ошибку 401" in body                      # главное предложение всегда на месте
+        assert "Windows" not in body and "Спасибо" not in body   # шум по краям отсекается всегда
+        assert lay._quote_lines(text) <= lines
+        assert all(s in sents for s in re.split(r"(?<=[.!?])\s+", body))  # только целые предложения

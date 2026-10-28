@@ -1,3 +1,4 @@
+import json
 import threading
 
 import pytest
@@ -6,14 +7,25 @@ from langchain_core.messages import AIMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from golos_digest.data import Topic
-from golos_digest.quotes import QuoteSelector, normalize_ranking, parse_ranking, prefilter
+from golos_digest.quotes import (
+    QuoteSelector, Selection, normalize_selection, parse_selection, prefilter,
+)
 
 _lock = threading.Lock()
 
+ENV_FIRST = (
+    "Добрый день! У меня рабочий стол на VDI, Windows 10, стоит VS Code 1.85 и GigaCode CLI версии 26.9.64. "
+    "Я системный аналитик в ДЗО. При подключении MCP confluence-delta после 2-3 запросов получаю ошибку 401, "
+    "токен при этом валидный. Из-за этого приходится каждый час перевыпускать токен вручную. Спасибо!"
+)
+SHORT = "Не могу подключиться к MCP: таймаут и ошибка 401, раньше всё работало нормально."
+
 
 class FakeModel(BaseChatModel):
-    mode: str = "tool"  # tool | text | fail
+    """mode: tool — function call; text — JSON текстом с <think>; fail — исключение."""
+    mode: str = "tool"
     calls: int = 0
+    answer: dict = {"quotes": [{"message": 1, "sentences": [4, 5]}]}
 
     @property
     def _llm_type(self):
@@ -28,74 +40,107 @@ class FakeModel(BaseChatModel):
         if self.mode == "fail":
             raise ConnectionError("503")
         if self.mode == "text":
-            msg = AIMessage(content='Ответ:\n```json\n{"ranking": [2, 1]}\n```')
+            msg = AIMessage(content=f"<think>сравню {{1}} и [2]</think>\n```json\n{json.dumps(self.answer)}\n```")
         else:
-            msg = AIMessage(content="", tool_calls=[{"name": "Ranking", "args": {"ranking": [2, 1]}, "id": "1"}])
+            msg = AIMessage(content="", tool_calls=[{"name": "Selection", "args": self.answer, "id": "1"}])
         return ChatResult(generations=[ChatGeneration(message=msg)])
 
 
 def topic():
-    texts = [
-        "Сервис падает с ошибкой 500 при загрузке файла, повторные попытки не помогают совсем.",
-        "Не могу подключиться к MCP: таймаут и ошибка 401, раньше всё работало нормально.",
-        "+1", "у меня тоже",
-    ]
-    return Topic("P", "Ошибки подключения MCP", 5, 4, -1, "", None, False, False, candidates=texts)
+    return Topic("GigaCode", "Ошибки авторизации MCP confluence", 5, 4, -1, "", None, False, False,
+                 candidates=[ENV_FIRST, SHORT, "+1", "у меня тоже"])
+
+
+EXPECTED = ("«При подключении MCP confluence-delta после 2-3 запросов получаю ошибку 401, токен при этом "
+            "валидный. Из-за этого приходится каждый час перевыпускать токен вручную.»")
+
+
+# ----------------------------------------------------------------------------- парсинг
 
 
 @pytest.mark.parametrize("raw,expected", [
-    ('{"ranking": [3, 1]}', [3, 1]),
-    ('```json\n{"ranking": [2]}\n```', [2]),
-    ("Лучшие: 4 и 2", [4, 2]),
+    ('{"quotes": [{"message": 2, "sentences": [3, 4]}]}', [(2, [3, 4])]),
+    ('<think>сравню {1} и [3]</think>\n```json\n{"quotes": [{"message": 1, "sentences": [2]}]}\n```', [(1, [2])]),
+    ('{"message": 3, "sentences": [1]}', [(3, [1])]),
+    ('{"ranking": [2, 1]}', [(2, []), (1, [])]),      # старый формат — сообщения без предложений
+    ("Лучшая цитата: 2.3 и 2.4", [(2, [3, 4])]),
 ])
-def test_parse_ranking(raw, expected):
-    assert parse_ranking(raw).ranking == expected
+def test_parse_selection(raw, expected):
+    assert [(e.message, e.sentences) for e in parse_selection(raw).quotes] == expected
 
 
-def test_normalize_ranking_dedup_and_bounds():
-    assert normalize_ranking([2, 2, 9, 1], 3) == [1, 0, 2]
+def test_parse_selection_garbage():
+    with pytest.raises(ValueError):
+        parse_selection("<think>думаю про 7 и 9")
 
 
-def test_prefilter_drops_noise():
+def test_normalize_selection_bounds_and_dupes():
+    shown = [["a", "b"], ["c"]]
+    sel = Selection.model_validate({"quotes": [
+        {"message": 1, "sentences": [2, 2, 9]}, {"message": 1, "sentences": [1]},
+        {"message": 7, "sentences": [1]}, {"message": 2, "sentences": []}]})
+    assert normalize_selection(sel, shown) == [[0, [1]], [1, []]]
+
+
+def test_prefilter_drops_noise_and_does_not_penalize_long():
     c = prefilter(topic(), __import__("golos_digest.config").config.QuoteConfig(), 10)
-    assert "+1" not in c and "у меня тоже" not in c and len(c) == 2
+    assert "+1" not in c and "у меня тоже" not in c
+    assert c[0] == ENV_FIRST  # длинное письмо с сильным фрагментом не проигрывает из-за длины
 
 
-@pytest.mark.parametrize("mode,calls,picked_second,cached", [
-    ("tool", 1, True, True),     # structured output
-    ("text", 2, True, True),     # structured вернул None -> текстовый фолбэк
-    ("fail", 2, False, False),   # ретраи -> эвристика, сбой не кэшируется
+# ----------------------------------------------------------------------------- селектор
+
+
+def test_heuristic_skips_environment_and_greeting(cfg):
+    q = QuoteSelector(cfg).select(topic())[0]
+    assert q.text == EXPECTED
+
+
+@pytest.mark.parametrize("mode,calls,cached", [
+    ("tool", 1, True),     # structured output
+    ("text", 2, True),     # structured вернул None -> текстовый фолбэк (с <think>)
+    ("fail", 2, False),    # ретраи -> эвристика, сбой не кэшируется
 ])
-def test_selector_modes(cfg, mode, calls, picked_second, cached):
+def test_selector_modes(cfg, mode, calls, cached):
     cfg.llm.backend, cfg.llm.retries = "gigachat", 1
-    t = topic()
     sel = QuoteSelector(cfg, llm=FakeModel(mode=mode))
-    cands = prefilter(t, cfg.quotes, cfg.llm.max_candidates)
-    picked = sel.select(t)
+    q = sel.select(topic())[0]
     assert sel.llm.calls == calls
-    assert (picked[0] == cands[1]) is picked_second
+    assert q.text == EXPECTED       # и LLM (предл. 4-5), и эвристика выбирают проблему, а не окружение
     assert bool(sel.cache.data) is cached
 
 
-@pytest.mark.parametrize("raw,expected", [
-    ("<think>Сравню {1} и [3]: 3 хуже, 1 лучше</think>\n{\"ranking\": [2, 1]}", [2, 1]),
-    ("<think>долго думаю про 7 и 9", None),  # обрыв внутри рассуждений — разбирать нечего
-    ("Итог: [3, 1]", [3, 1]),
-])
-def test_parse_ranking_reasoning_models(raw, expected):
-    if expected is None:
-        with pytest.raises(ValueError):
-            parse_ranking(raw)
-    else:
-        assert parse_ranking(raw).ranking == expected
+def test_llm_sentence_choice_is_respected(cfg):
+    """LLM выбрала одно предложение — цитата ровно из него, без добавок."""
+    cfg.llm.backend = "gigachat"
+    model = FakeModel(answer={"quotes": [{"message": 1, "sentences": [4]}]})
+    q = QuoteSelector(cfg, llm=model).select(topic())[0]
+    assert q.text.startswith("«При подключении") and q.text.endswith("валидный.»")
+
+
+def test_llm_gap_filled_or_marked(cfg):
+    cfg.llm.backend = "gigachat"
+    model = FakeModel(answer={"quotes": [{"message": 1, "sentences": [5, 2]}]})  # 2 и 5: пропуск из двух
+    q = QuoteSelector(cfg, llm=model).select(topic())[0]
+    assert "… Из-за этого" in q.text  # несмежные предложения — через «…», а не склеены
 
 
 def test_structured_output_off_single_call(cfg):
     cfg.llm.backend, cfg.llm.retries, cfg.llm.structured_output = "gigachat", 1, False
     sel = QuoteSelector(cfg, llm=FakeModel(mode="text"))
-    t = topic()
-    assert sel.select(t)[0] == prefilter(t, cfg.quotes, 40)[1]
+    assert sel.select(topic())[0].text == EXPECTED
     assert sel.llm.calls == 1  # без попытки function calling
+
+
+def test_two_quotes_from_different_messages(cfg):
+    cfg.llm.backend, cfg.quotes.max_quotes = "gigachat", 2
+    model = FakeModel(answer={"quotes": [{"message": 1, "sentences": [4]}, {"message": 1, "sentences": [5]},
+                                         {"message": 2, "sentences": [1]}]})
+    qs = QuoteSelector(cfg, llm=model).select(topic())
+    assert len(qs) == 2 and qs[1].text == f"«{SHORT}»"
+
+
+# ----------------------------------------------------------------------------- фабрика модели
 
 
 def test_gigachat_factory_mtls(tmp_path, monkeypatch):

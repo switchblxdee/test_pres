@@ -31,6 +31,7 @@ from .config import Config, load_config
 from .data import Digest, Topic, load_digest
 from .measure import Measurer
 from .quotes import QuoteSelector
+from .sentences import Quote
 from .render import Layouter, Renderer
 
 log = logging.getLogger(__name__)
@@ -47,7 +48,7 @@ class DigestState(TypedDict, total=False):
     input_path: str
     output_path: str
     digest: Digest
-    quotes: Annotated[dict[int, list[str]], _merge_dicts]   # редьюсер для параллельных веток
+    quotes: Annotated[dict[int, list[Quote]], _merge_dicts]   # редьюсер для параллельных веток
     n_slides: int
     output: str
     timings: Annotated[list[tuple[str, float]], operator.add]

@@ -36,7 +36,7 @@ class Topic:
     is_new: bool
     resumed: bool
     candidates: list[str] = field(default_factory=list)
-    quotes: list[str] = field(default_factory=list)
+    quotes: list = field(default_factory=list)   # list[sentences.Quote]
 
 
 @dataclass

@@ -76,8 +76,8 @@ class LLMConfig:
 class QuoteConfig:
     max_quotes: int = 1          # 1 = одна лучшая цитата; 2 = добавить вторую, если влезает
     max_quote_lines: int = 5     # жёсткий потолок высоты цитаты на слайде
-    ideal_min_chars: int = 60
-    ideal_max_chars: int = 420
+    ideal_min_chars: int = 60    # не используется (оставлено для совместимости старых конфигов)
+    ideal_max_chars: int = 420   # бюджет фрагмента цитаты в символах
     min_chars: int = 20          # короче этого сообщение не рассматривается вовсе
 
 

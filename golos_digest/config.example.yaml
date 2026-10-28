@@ -35,9 +35,8 @@ llm:
 
 quotes:
   max_quotes: 1                 # 2 — добавлять вторую цитату, если влезает в max_quote_lines
-  max_quote_lines: 5
-  ideal_min_chars: 60
-  ideal_max_chars: 420
+  max_quote_lines: 5             # потолок высоты цитаты на слайде (строк)
+  ideal_max_chars: 420          # бюджет фрагмента: сколько символов проблемы брать из сообщения
   min_chars: 20
 
 fonts:
