@@ -59,7 +59,7 @@ class LLMConfig:
     api_key_env: str = "OPENAI_API_KEY"  # для backend=openai
     temperature: float = 0.0
     repetition_penalty: float | None = 1.05
-    timeout: float = 99999
+    timeout: float = 600
     # Прочие параметры конструктора GigaChat как есть (max_tokens, top_p, profanity_check, ...)
     extra: dict = field(default_factory=dict)
     # Ранжировать через function calling. Если модель/контур не поддерживает функции —

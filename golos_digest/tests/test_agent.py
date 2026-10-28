@@ -28,10 +28,14 @@ def test_agent_class_run_and_reuse(make_xlsx, cfg, tmp_path):
     assert r2.llm_calls == 0 and model.calls == 1
 
 
-def test_agent_default_output_next_to_input(make_xlsx, cfg):
+def test_agent_default_output_in_cwd_absolute(make_xlsx, cfg, tmp_path, monkeypatch):
     path = _xlsx(make_xlsx)
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)
     r = DigestAgent(cfg).run(path)
-    assert r.path.parent == path.parent and r.path.name.startswith("golos_it_digest_")
+    assert r.path.is_absolute() and r.path.parent == work and r.path.name.startswith("golos_it_digest_")
+    assert r.path.exists()
 
 
 def test_agent_failures_are_reported(make_xlsx, cfg, tmp_path):

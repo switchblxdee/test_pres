@@ -23,7 +23,7 @@ llm:
   verify_ssl_certs: true
   temperature: 0.0
   repetition_penalty: 1.05
-  timeout: 99999
+  timeout: 600                  # сек на запрос; 99999 — зависший запрос «замораживает» прогон на часы
   # extra: {max_tokens: 512}    # любые другие параметры GigaChat(...)
   # Если контур/модель не поддерживает function calling — false (сразу текстовый JSON)
   structured_output: true

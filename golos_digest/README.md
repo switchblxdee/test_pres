@@ -7,7 +7,7 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml                     # пути к сертификатам, модель, контур
 python -m golos_digest выгрузка.xlsx -o digest.pptx -c config.yaml
 python -m golos_digest выгрузка.xlsx --backend heuristic   # без LLM, для отладки вёрстки
-python run_digest.py выгрузка.xlsx                         # со своим объектом GigaChat(...)
+python run_digest.py выгрузка.xlsx                         # со своим GigaChat(...); без аргументов — INPUT_XLSX в файле
 python tools/make_demo_xlsx.py demo.xlsx               # синтетика в боевом формате
 python -m pytest -q tests                              # 64 теста
 ```
@@ -23,6 +23,10 @@ result = agent.run("выгрузка.xlsx", "digest.pptx")       # DigestResult:
 agent.graph                                             # скомпилированный LangGraph
 print(agent.draw())                                     # mermaid-схема графа
 ```
+
+Без `-o` презентация сохраняется в **текущую папку** как `golos_it_digest_ГГГГММДД.pptx`;
+полный путь печатается в конце (`Презентация: …`). В логе виден прогресс по темам
+(`цитаты 5/22`) и раз в минуту — «пульс», если модель долго отвечает.
 
 Авторизация GigaChat: mTLS (`llm.cert_file` + `llm.key_file`, ключ не нужен) или
 ключ в переменной `GIGACHAT_CREDENTIALS`. Пароль от зашифрованного ключа — `GIGACHAT_KEY_PASSWORD`.

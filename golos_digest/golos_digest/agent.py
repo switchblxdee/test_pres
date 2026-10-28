@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import operator
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date
@@ -84,7 +85,14 @@ class DigestAgent:
         llm: готовая LangChain-модель; если не передана — создаётся из config.llm."""
         self.cfg = config if isinstance(config, Config) else load_config(config)
         self.selector = QuoteSelector(self.cfg, llm=llm)
+        self._progress_lock = threading.Lock()
+        self._total = self._done = 0
         self.graph = self._build_graph()
+        timeout = getattr(self.llm, "timeout", None)
+        if isinstance(timeout, (int, float)) and timeout > 1800:
+            log.warning("Таймаут запроса к модели %.0f с (~%.0f ч): зависший запрос будет ждать столько же, "
+                        "а прогон — выглядеть замершим. Для еженедельного запуска разумно 300–600 с.",
+                        timeout, timeout / 3600)
 
     @classmethod
     def from_yaml(cls, path: str | Path, llm: BaseChatModel | None = None) -> "DigestAgent":
@@ -103,14 +111,23 @@ class DigestAgent:
                  len(digest.products), digest.meta.active_topics, digest.meta.new_topics)
         return {"digest": digest, "quotes": {}, "timings": [("load", time.perf_counter() - t0)]}
 
-    @staticmethod
-    def _fan_out(state: DigestState):
+    def _fan_out(self, state: DigestState):
         tasks = [Send("select_quotes", TopicTask(idx=i, topic=t))
                  for i, t in enumerate(state["digest"].topics) if t.candidates]
+        with self._progress_lock:
+            self._total, self._done = len(tasks), 0
+        if tasks:
+            who = self.selector.model_tag if self.llm is not None else "эвристика, без LLM"
+            log.info("Отбор цитат: %d тем (%s, до %d параллельно)…", len(tasks), who, self.cfg.llm.max_workers)
         return tasks or "assemble"
 
     def _select_quotes(self, task: TopicTask) -> DigestState:
-        return {"quotes": {task["idx"]: self.selector.select(task["topic"])}}
+        quotes = self.selector.select(task["topic"])
+        with self._progress_lock:
+            self._done += 1
+            done, total = self._done, self._total
+        log.info("  цитаты %d/%d: %s", done, total, task["topic"].title[:70])
+        return {"quotes": {task["idx"]: quotes}}
 
     def _assemble(self, state: DigestState) -> DigestState:
         digest = state["digest"]
@@ -121,6 +138,7 @@ class DigestAgent:
 
     def _render(self, state: DigestState) -> DigestState:
         t0 = time.perf_counter()
+        log.info("Вёрстка и сохранение: %s", state["output_path"])
         measurer = Measurer(self.cfg.fonts)
         plans = Layouter(self.cfg, measurer).plan(state["digest"])
         out = Renderer(self.cfg, measurer).render(state["digest"], plans, state["output_path"])
@@ -142,20 +160,41 @@ class DigestAgent:
     # ---- запуск
 
     def run(self, input_xlsx: str | Path, output_pptx: str | Path | None = None) -> DigestResult:
-        """Синхронный запуск. Без output_pptx файл кладётся рядом с xlsx."""
-        input_xlsx = Path(input_xlsx)
+        """Синхронный запуск. Без output_pptx файл сохраняется в ТЕКУЩУЮ папку
+        как golos_it_digest_ГГГГММДД.pptx; итоговый путь — абсолютный, в логе и в результате."""
+        input_xlsx = Path(input_xlsx).expanduser().resolve()
         if not input_xlsx.is_file():
             raise FileNotFoundError(f"Нет файла: {input_xlsx}")
-        output_pptx = Path(output_pptx) if output_pptx else \
-            input_xlsx.with_name(f"golos_it_digest_{date.today():%Y%m%d}.pptx")
+        output_pptx = Path(output_pptx).expanduser() if output_pptx else Path(f"golos_it_digest_{date.today():%Y%m%d}.pptx")
+        output_pptx = output_pptx.resolve()
+        if output_pptx.suffix.lower() != ".pptx":
+            output_pptx = output_pptx.with_suffix(".pptx")
+        log.info("Вход: %s", input_xlsx)
         calls0, fails0 = self.selector.llm_calls, self.selector.llm_failures
         t0 = time.perf_counter()
-        state = self.graph.invoke(
-            {"input_path": str(input_xlsx), "output_path": str(output_pptx)},
-            config={"max_concurrency": max(1, self.cfg.llm.max_workers), "recursion_limit": 50},
-        )
+
+        stop = threading.Event()
+
+        def heartbeat() -> None:  # раз в минуту — что прогон жив и чего ждёт
+            while not stop.wait(60):
+                with self._progress_lock:
+                    done, total = self._done, self._total
+                if total and done < total:
+                    log.info("…жду ответы модели: готово %d/%d тем, прошло %.0f мин",
+                             done, total, (time.perf_counter() - t0) / 60)
+
+        hb = threading.Thread(target=heartbeat, daemon=True)
+        hb.start()
+        try:
+            state = self.graph.invoke(
+                {"input_path": str(input_xlsx), "output_path": str(output_pptx)},
+                config={"max_concurrency": max(1, self.cfg.llm.max_workers), "recursion_limit": 50},
+            )
+        finally:
+            stop.set()
         result = DigestResult(
-            path=Path(state["output"]), n_slides=state["n_slides"], n_topics=len(state["digest"].topics),
+            path=Path(state["output"]).resolve(), n_slides=state["n_slides"],
+            n_topics=len(state["digest"].topics),
             llm_calls=self.selector.llm_calls - calls0, llm_failures=self.selector.llm_failures - fails0,
             seconds=time.perf_counter() - t0,
         )
