@@ -7,7 +7,7 @@ from lxml import etree
 from pptx import Presentation
 
 from golos_digest.data import load_digest
-from golos_digest.graph import build
+from golos_digest.agent import build
 from golos_digest.measure import Measurer
 from golos_digest.quotes import QuoteSelector
 from golos_digest.render import (

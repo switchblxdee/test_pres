@@ -45,16 +45,26 @@ MARKUP_REQUIRED = ("product", "topic", "text")
 class LLMConfig:
     # gigachat | openai | heuristic
     backend: str = "gigachat"
-    model: str = "GigaChat-2-Max"
-    # GigaChat
-    credentials_env: str = "GIGACHAT_CREDENTIALS"
-    scope: str = "GIGACHAT_API_CORP"
-    base_url: str | None = None          # для openai-совместимого API или своего контура GigaChat
-    api_key_env: str = "OPENAI_API_KEY"  # для backend=openai
-    verify_ssl_certs: bool = False
+    model: str = "Qwen3.5-397b"
+    base_url: str | None = "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1"
+    # Авторизация GigaChat: mTLS (cert_file + key_file) ИЛИ ключ из переменной credentials_env.
+    # Если задан cert_file, ключ не нужен; scope передаётся только вместе с ключом.
+    cert_file: str | None = None
+    key_file: str | None = None
+    key_file_password_env: str = "GIGACHAT_KEY_PASSWORD"  # если ключ зашифрован
     ca_bundle_file: str | None = None
-    temperature: float = 0.05
-    timeout: float = 90.0
+    verify_ssl_certs: bool = True
+    credentials_env: str = "GIGACHAT_CREDENTIALS"
+    scope: str | None = None
+    api_key_env: str = "OPENAI_API_KEY"  # для backend=openai
+    temperature: float = 0.0
+    repetition_penalty: float | None = 1.05
+    timeout: float = 99999
+    # Прочие параметры конструктора GigaChat как есть (max_tokens, top_p, profanity_check, ...)
+    extra: dict = field(default_factory=dict)
+    # Ранжировать через function calling. Если модель/контур не поддерживает функции —
+    # false: сразу текстовый JSON, без лишнего запроса на каждую тему.
+    structured_output: bool = True
     retries: int = 3
     max_workers: int = 8
     max_candidates: int = 40             # сколько сообщений по теме максимум уходит в промпт

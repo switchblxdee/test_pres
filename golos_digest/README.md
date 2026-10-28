@@ -4,19 +4,35 @@ xlsx (листы «разметка» + «свод») → .pptx в дизайн�
 
 ```bash
 pip install -r requirements.txt
-export GIGACHAT_CREDENTIALS=...            # ключ авторизации GigaChat
-python -m golos_digest input.xlsx -o digest.pptx -c config.yaml
-python -m golos_digest input.xlsx --backend heuristic   # без LLM, для отладки вёрстки
-python tools/make_demo_xlsx.py demo.xlsx                # синтетика в боевом формате
-python -m pytest -q tests                               # 34 теста: данные, LLM-цепочка, вёрстка
+cp config.example.yaml config.yaml                     # пути к сертификатам, модель, контур
+python -m golos_digest выгрузка.xlsx -o digest.pptx -c config.yaml
+python -m golos_digest выгрузка.xlsx --backend heuristic   # без LLM, для отладки вёрстки
+python run_digest.py выгрузка.xlsx                         # со своим объектом GigaChat(...)
+python tools/make_demo_xlsx.py demo.xlsx               # синтетика в боевом формате
+python -m pytest -q tests                              # 44 теста
 ```
+
+Из кода:
+
+```python
+from langchain_gigachat.chat_models import GigaChat
+from golos_digest import DigestAgent
+
+agent = DigestAgent("config.yaml", llm=GigaChat(...))   # llm не передан -> создаётся из config.llm
+result = agent.run("выгрузка.xlsx", "digest.pptx")       # DigestResult: path, n_slides, llm_calls, ...
+agent.graph                                             # скомпилированный LangGraph
+print(agent.draw())                                     # mermaid-схема графа
+```
+
+Авторизация GigaChat: mTLS (`llm.cert_file` + `llm.key_file`, ключ не нужен) или
+ключ в переменной `GIGACHAT_CREDENTIALS`. Пароль от зашифрованного ключа — `GIGACHAT_KEY_PASSWORD`.
 
 ## Как устроено
 
 | Модуль | Что делает |
 |---|---|
 | `data.py` | Читает листы, сопоставляет колонки по синонимам, считает динамику, новые/возобновлённые темы, KPI |
-| `graph.py` | Пайплайн на LangGraph: `load → (Send × темы) select_quotes → assemble → render` |
+| `agent.py` | `DigestAgent`: граф LangGraph `load → (Send × темы) select_quotes → assemble → render`, узлы — методы класса |
 | `quotes.py` | Эвристический префильтр → LCEL-цепочка ранжирования (structured output + текстовый фолбэк + retry) → кэш |
 | `measure.py` | Перенос строк по реальным метрикам шрифта (PIL) |
 | `render.py` | Пагинация + клонирование компонентов эталонного слайда шаблона |
@@ -30,7 +46,9 @@ python -m pytest -q tests                               # 34 теста: дан�
 **Граф LangGraph.** Отбор цитат — fan-out через `Send`: каждая тема отдельная параллельная ветка,
 результаты сливаются редьюсером; параллелизм ограничен `llm.max_workers` (`max_concurrency`).
 Модель — `langchain_gigachat.GigaChat` (или `ChatOpenAI` для openai-совместимого API); свою
-модель можно передать в `build(..., llm=...)` / `build_graph(cfg, llm=...)`.
+модель передаётся в `DigestAgent(cfg, llm=...)`. Ответы reasoning-моделей с блоком
+`<think>…</think>` разбираются корректно; если контур не поддерживает function calling —
+`llm.structured_output: false`, тогда на тему уходит ровно один запрос.
 
 **LLM выбирает только номер сообщения**, текст цитаты берётся дословно из разметки:
 модель не может выдумать или исказить цитату. Ответ берётся через `with_structured_output(Ranking)`;

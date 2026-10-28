@@ -120,7 +120,14 @@ def prefilter(topic: Topic, q: QuoteConfig, limit: int) -> list[str]:
 # ----------------------------------------------------------------------------- модели LangChain
 
 
+def _check_file(path: str | None, what: str) -> str | None:
+    if path and not Path(path).expanduser().is_file():
+        raise RuntimeError(f"Не найден {what}: {path}")
+    return str(Path(path).expanduser()) if path else None
+
+
 def make_chat_model(c: LLMConfig) -> BaseChatModel | None:
+    """Модель из конфига. Для своего, уже созданного клиента — DigestAgent(cfg, llm=model)."""
     if c.backend == "heuristic":
         return None
     if c.backend == "gigachat":
@@ -129,40 +136,59 @@ def make_chat_model(c: LLMConfig) -> BaseChatModel | None:
         except ImportError:
             raise RuntimeError("Не установлен langchain-gigachat: pip install langchain-gigachat "
                                "(или запусти с --backend heuristic)") from None
+        kwargs: dict = dict(
+            model=c.model, base_url=c.base_url, temperature=c.temperature, timeout=c.timeout,
+            verify_ssl_certs=c.verify_ssl_certs, max_retries=0,  # ретраи — на уровне цепочки
+            ca_bundle_file=_check_file(c.ca_bundle_file, "ca_bundle_file"),
+            cert_file=_check_file(c.cert_file, "cert_file"),
+            key_file=_check_file(c.key_file, "key_file"),
+            repetition_penalty=c.repetition_penalty,
+        )
+        if os.environ.get(c.key_file_password_env):
+            kwargs["key_file_password"] = os.environ[c.key_file_password_env]
         creds = os.environ.get(c.credentials_env)
-        if not creds:
-            raise RuntimeError(f"Не задана переменная окружения {c.credentials_env} с ключом GigaChat")
-        kwargs = dict(credentials=creds, scope=c.scope, model=c.model, temperature=c.temperature,
-                      verify_ssl_certs=c.verify_ssl_certs, timeout=c.timeout, max_retries=0)
-        if c.base_url:
-            kwargs["base_url"] = c.base_url
-        if c.ca_bundle_file:
-            kwargs["ca_bundle_file"] = c.ca_bundle_file
-        return GigaChat(**kwargs)
+        if creds:
+            kwargs["credentials"] = creds
+            if c.scope:
+                kwargs["scope"] = c.scope
+        elif not (c.cert_file and c.key_file):
+            raise RuntimeError(f"Нет авторизации GigaChat: укажи llm.cert_file + llm.key_file (mTLS) "
+                               f"или задай переменную окружения {c.credentials_env}")
+        kwargs.update(c.extra)
+        return GigaChat(**{k: v for k, v in kwargs.items() if v is not None})
     if c.backend == "openai":
         try:
             from langchain_openai import ChatOpenAI
         except ImportError:
             raise RuntimeError("Не установлен langchain-openai: pip install langchain-openai") from None
         return ChatOpenAI(model=c.model, base_url=c.base_url, temperature=c.temperature, timeout=c.timeout,
-                          api_key=os.environ.get(c.api_key_env, "EMPTY"), max_retries=0)
+                          api_key=os.environ.get(c.api_key_env, "EMPTY"), max_retries=0, **c.extra)
     raise ValueError(f"Неизвестный llm.backend: {c.backend}")
 
 
+_THINK = re.compile(r"<think>.*?(</think>|$)", flags=re.S | re.I)
+
+
 def parse_ranking(raw: str) -> Ranking:
-    """Текстовый фолбэк: достаёт ranking из ответа, терпимо к ```json``` и мусору вокруг."""
-    m = re.search(r"\{.*\}", raw or "", flags=re.S)
+    """Текстовый ответ -> Ranking. Терпим к ```json```, тексту вокруг и блоку рассуждений
+    <think>…</think> (Qwen3 и др.), в котором могут быть свои цифры и скобки."""
+    text = _THINK.sub("", raw or "")
     ids: list[int] = []
-    if m:
+    for blob in reversed(re.findall(r"\{[^{}]*\}", text)):  # последний JSON-объект — итоговый
         try:
-            data = json.loads(m.group())
+            data = json.loads(blob)
             ids = [int(x) for x in data.get("ranking", data.get("best_ids", []))]
         except (ValueError, TypeError, AttributeError):
-            ids = []
+            continue
+        if ids:
+            break
     if not ids:
-        ids = [int(x) for x in re.findall(r"\d+", raw or "")[:3]]
+        m = re.search(r"\[([\d\s,]+)\]", text)  # голый массив [2, 1]
+        ids = [int(x) for x in re.findall(r"\d+", m.group(1))] if m else []
     if not ids:
-        raise ValueError(f"Не удалось разобрать ответ модели: {raw[:200]!r}")
+        ids = [int(x) for x in re.findall(r"\d+", text)[:3]]
+    if not ids:
+        raise ValueError(f"Не удалось разобрать ответ модели: {(raw or '')[:200]!r}")
     return Ranking(ranking=ids)
 
 
@@ -174,13 +200,15 @@ def _require(res: Ranking | None) -> Ranking:
     return res
 
 
-def build_ranker(llm: BaseChatModel, retries: int) -> Runnable:
+def build_ranker(llm: BaseChatModel, retries: int, structured: bool = True) -> Runnable:
     text_chain = PROMPT | llm | StrOutputParser() | RunnableLambda(parse_ranking)
-    try:
-        structured = PROMPT | llm.with_structured_output(Ranking) | RunnableLambda(_require)
-        chain = structured.with_fallbacks([text_chain])
-    except NotImplementedError:  # модель без tool calling
-        chain = text_chain
+    chain: Runnable = text_chain
+    if structured:
+        try:
+            chain = (PROMPT | llm.with_structured_output(Ranking) | RunnableLambda(_require)
+                     ).with_fallbacks([text_chain])
+        except NotImplementedError:  # модель без tool calling
+            chain = text_chain
     return chain.with_retry(stop_after_attempt=max(1, retries), wait_exponential_jitter=True)
 
 
@@ -228,9 +256,14 @@ class QuoteSelector:
     def __init__(self, cfg: Config, llm: BaseChatModel | None = None):
         self.cfg = cfg
         self.llm = llm if llm is not None else make_chat_model(cfg.llm)
-        self.ranker = build_ranker(self.llm, cfg.llm.retries) if self.llm is not None else None
+        self.ranker = (build_ranker(self.llm, cfg.llm.retries, cfg.llm.structured_output)
+                       if self.llm is not None else None)
         self.cache = QuoteCache(Path(cfg.llm.cache_dir) / "quotes.json")
-        self.model_tag = f"{cfg.llm.backend}:{cfg.llm.model if self.llm is not None else '-'}"
+        self.llm_calls = 0      # темы, ушедшие в LLM (без кэша)
+        self.llm_failures = 0   # из них откатились на эвристику
+        self._stats_lock = threading.Lock()
+        name = getattr(self.llm, "model", None) or getattr(self.llm, "model_name", None) or cfg.llm.model
+        self.model_tag = f"{type(self.llm).__name__}:{name}" if self.llm is not None else "heuristic"
 
     def _key(self, topic: Topic, cands: list[str]) -> str:
         h = hashlib.sha1()
@@ -247,6 +280,8 @@ class QuoteSelector:
         messages = "\n\n".join(
             f"[{i}] " + (c if len(c) <= lim else c[:lim] + "…") for i, c in enumerate(cands, 1)
         )
+        with self._stats_lock:
+            self.llm_calls += 1
         try:
             res: Ranking = self.ranker.invoke({
                 "product": topic.product, "topic": topic.title, "messages": messages,
@@ -254,6 +289,8 @@ class QuoteSelector:
             })
             return normalize_ranking(res.ranking, len(cands)), True
         except Exception as e:  # сеть, 429, 5xx, токен, мусор в ответе — после всех ретраев
+            with self._stats_lock:
+                self.llm_failures += 1
             log.warning("LLM не ответил для темы «%s» (%s) — беру эвристику", topic.title, e)
             return list(range(len(cands))), False
 

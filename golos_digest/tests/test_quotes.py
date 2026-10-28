@@ -75,3 +75,50 @@ def test_selector_modes(cfg, mode, calls, picked_second, cached):
     assert sel.llm.calls == calls
     assert (picked[0] == cands[1]) is picked_second
     assert bool(sel.cache.data) is cached
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("<think>Сравню {1} и [3]: 3 хуже, 1 лучше</think>\n{\"ranking\": [2, 1]}", [2, 1]),
+    ("<think>долго думаю про 7 и 9", None),  # обрыв внутри рассуждений — разбирать нечего
+    ("Итог: [3, 1]", [3, 1]),
+])
+def test_parse_ranking_reasoning_models(raw, expected):
+    if expected is None:
+        with pytest.raises(ValueError):
+            parse_ranking(raw)
+    else:
+        assert parse_ranking(raw).ranking == expected
+
+
+def test_structured_output_off_single_call(cfg):
+    cfg.llm.backend, cfg.llm.retries, cfg.llm.structured_output = "gigachat", 1, False
+    sel = QuoteSelector(cfg, llm=FakeModel(mode="text"))
+    t = topic()
+    assert sel.select(t)[0] == prefilter(t, cfg.quotes, 40)[1]
+    assert sel.llm.calls == 1  # без попытки function calling
+
+
+def test_gigachat_factory_mtls(tmp_path, monkeypatch):
+    from golos_digest.config import LLMConfig
+    from golos_digest.quotes import make_chat_model
+    monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+    files = {}
+    for name in ("serv.pem", "client.pem", "client.key"):
+        files[name] = tmp_path / name
+        files[name].write_text("x")
+    c = LLMConfig(ca_bundle_file=str(files["serv.pem"]), cert_file=str(files["client.pem"]),
+                  key_file=str(files["client.key"]), extra={"max_tokens": 256})
+    m = make_chat_model(c)
+    assert (m.model, m.base_url, m.temperature, m.repetition_penalty, m.verify_ssl_certs) == \
+        ("Qwen3.5-397b", "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1", 0.0, 1.05, True)
+    assert m.cert_file == str(files["client.pem"]) and m.credentials is None and m.max_tokens == 256
+
+
+def test_gigachat_factory_errors(tmp_path, monkeypatch):
+    from golos_digest.config import LLMConfig
+    from golos_digest.quotes import make_chat_model
+    monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+    with pytest.raises(RuntimeError, match="Нет авторизации"):
+        make_chat_model(LLMConfig())
+    with pytest.raises(RuntimeError, match="Не найден cert_file"):
+        make_chat_model(LLMConfig(cert_file=str(tmp_path / "nope.pem"), key_file=str(tmp_path / "k")))

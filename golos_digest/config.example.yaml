@@ -14,13 +14,20 @@ resumed_status_regex: 'возобнов'
 
 llm:
   backend: gigachat             # gigachat | openai | heuristic (без LLM, для отладки)
-  model: GigaChat-2-Max
-  credentials_env: GIGACHAT_CREDENTIALS   # имя переменной окружения с ключом авторизации
-  scope: GIGACHAT_API_CORP
-  # base_url: https://gigachat.devices.sberbank.ru/api/v1   # свой контур, если нужен
-  verify_ssl_certs: false
-  # ca_bundle_file: /path/to/russian_trusted_root_ca.cer
-  temperature: 0.05
+  model: Qwen3.5-397b
+  base_url: https://gigachat-ift.sberdevices.delta.sbrf.ru/v1
+  # mTLS: с сертификатом ключ авторизации не нужен
+  ca_bundle_file: /home/work/23101393@sigma.sbrf.ru/vs_code/serv.pem
+  cert_file: /home/work/23101393@sigma.sbrf.ru/vs_code/CI03121738-DEV-AIBOLIT.pem
+  key_file: /home/work/23101393@sigma.sbrf.ru/vs_code/CI03121738-DEV-AIBOLIT.key
+  verify_ssl_certs: true
+  temperature: 0.0
+  repetition_penalty: 1.05
+  timeout: 99999
+  # extra: {max_tokens: 512}    # любые другие параметры GigaChat(...)
+  # Если контур/модель не поддерживает function calling — false (сразу текстовый JSON)
+  structured_output: true
+  retries: 3
   max_workers: 8                # параллельные запросы по темам
   max_candidates: 40            # сообщений на тему в промпте (после эвристического префильтра)
   candidate_max_chars: 900
